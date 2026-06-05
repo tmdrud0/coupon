@@ -31,27 +31,25 @@ Duplicate issue requests return `409 ALREADY_ISSUED`.
 
 ## Load test
 
-Prepare deterministic data:
+Run the Docker-based load test helper while the Spring API is already running:
 
 ```powershell
-Get-Content .\load-test\prepare-load-test.sql | docker exec -i coupon-mysql mysql -uroot -proot coupon
+powershell -ExecutionPolicy Bypass -File .\load-test\run-load-test.ps1
 ```
 
-Run k6 through Docker:
+The script starts Compose MySQL, prepares deterministic data, runs `grafana/k6`, writes a k6 summary under `build\load-test`, and verifies the expected MySQL counts.
+
+Common overrides:
 
 ```powershell
-$root = (Get-Location).Path
-docker run --rm -e BASE_URL=http://host.docker.internal:8080 -e COUPON_ID=1 -e VUS=100 -e ITERATIONS=1000 -v "${root}\load-test:/scripts" grafana/k6 run /scripts/issue-coupon.js
+powershell -ExecutionPolicy Bypass -File .\load-test\run-load-test.ps1 -K6BaseUrl http://host.docker.internal:8080 -Vus 100 -Iterations 1000 -CouponId 1 -UsernamePrefix load-test
 ```
 
-Verify the database:
+`K6BaseUrl` defaults to `http://host.docker.internal:8080`. It can be overridden with `-K6BaseUrl`, `K6_BASE_URL`, or `BASE_URL`; when both environment variables are set, `K6_BASE_URL` wins. Environment variables are also supported for `VUS`, `ITERATIONS`, `COUPON_ID`, and `USERNAME_PREFIX`.
 
 ```powershell
-@'
-SELECT
-  (SELECT COUNT(*) FROM coupon_issues WHERE coupon_id = 1) AS issues,
-  (SELECT COUNT(DISTINCT user_id) FROM coupon_issues WHERE coupon_id = 1) AS distinct_issue_users,
-  (SELECT COUNT(*) FROM coupon_stock_slots WHERE coupon_id = 1 AND status = 'ISSUED') AS issued_slots,
-  (SELECT COUNT(*) FROM coupon_stock_slots WHERE coupon_id = 1 AND status = 'AVAILABLE') AS available_slots;
-'@ | docker exec -i coupon-mysql mysql -uroot -proot coupon
+$env:K6_BASE_URL = 'http://host.docker.internal:8080'
+$env:VUS = '100'
+$env:ITERATIONS = '1000'
+powershell -ExecutionPolicy Bypass -File .\load-test\run-load-test.ps1
 ```

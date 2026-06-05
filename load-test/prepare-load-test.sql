@@ -5,11 +5,13 @@ TRUNCATE TABLE coupons;
 TRUNCATE TABLE users;
 SET FOREIGN_KEY_CHECKS=1;
 
+SET @coupon_id = COALESCE(@coupon_id, 1);
+
 INSERT INTO coupons (id, name, description, issue_start_at, total_quantity, created_at)
-VALUES (1, 'Load Test Coupon', 'Coupon for k6 load testing.', '2020-01-01 00:00:00.000000', 500, UTC_TIMESTAMP(6));
+VALUES (@coupon_id, 'Load Test Coupon', 'Coupon for k6 load testing.', '2020-01-01 00:00:00.000000', 500, UTC_TIMESTAMP(6));
 
 INSERT INTO coupon_stock_slots (coupon_id, status, created_at)
-SELECT 1, 'AVAILABLE', UTC_TIMESTAMP(6)
+SELECT @coupon_id, 'AVAILABLE', UTC_TIMESTAMP(6)
 FROM (
     SELECT 0 n UNION ALL SELECT 1 UNION ALL SELECT 2 UNION ALL SELECT 3 UNION ALL SELECT 4
     UNION ALL SELECT 5 UNION ALL SELECT 6 UNION ALL SELECT 7 UNION ALL SELECT 8 UNION ALL SELECT 9
