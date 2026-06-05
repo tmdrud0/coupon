@@ -47,6 +47,22 @@ powershell -ExecutionPolicy Bypass -File .\load-test\run-load-test.ps1 -Mode Iss
 
 Issue-only session files are written as `build\load-test\issue-only-sessions-<timestamp>.json`, and issue-only summaries are written as `build\load-test\k6-issue-only-summary-<timestamp>.json`. Because login happens before k6 starts, k6 HTTP metrics contain issue requests only; with the default settings, total `http_reqs` is `1000`.
 
+Run a quick benchmark validation with repeated issue-only scenarios:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\load-test\run-benchmark.ps1 -Mode IssueOnly -VusList 20 -IterationsList 100 -Repeats 2
+```
+
+The benchmark runner calls `run-load-test.ps1` for each scenario and repeat, using a unique username prefix per run. It writes per-run CSV and aggregate JSON files under `build\load-test`, captures k6 request and latency metrics, records selected MySQL status counters before and after each run, and includes a best-effort Docker stats snapshot for `coupon-mysql`.
+
+Run only one load test or benchmark runner at a time. These helpers reset the shared load-test MySQL tables before each run, so concurrent executions invalidate the measurements.
+
+For a longer reliability run, pass multiple VU and iteration values:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\load-test\run-benchmark.ps1 -Mode IssueOnly -VusList 100,300,500 -IterationsList 10000 -Repeats 3
+```
+
 Common overrides:
 
 ```powershell
