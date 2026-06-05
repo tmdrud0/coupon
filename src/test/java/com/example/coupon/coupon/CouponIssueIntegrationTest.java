@@ -44,6 +44,9 @@ class CouponIssueIntegrationTest {
 	CouponStockSlotDao couponStockSlotDao;
 
 	@Autowired
+	CouponRedisReservationService couponRedisReservationService;
+
+	@Autowired
 	UserAccountRepository userAccountRepository;
 
 	@Autowired
@@ -54,6 +57,8 @@ class CouponIssueIntegrationTest {
 
 	@BeforeEach
 	void cleanDatabase() {
+		jdbcTemplate.queryForList("SELECT id FROM coupons", Long.class)
+				.forEach(couponRedisReservationService::resetCoupon);
 		jdbcTemplate.update("DELETE FROM coupon_issues");
 		jdbcTemplate.update("DELETE FROM coupon_stock_slots");
 		jdbcTemplate.update("DELETE FROM coupons");
@@ -148,6 +153,79 @@ class CouponIssueIntegrationTest {
 	}
 
 	@Test
+	void failDuplicateAfterRedisStateIsRebuiltAsAlreadyIssued() {
+		UserAccount user = createUser("user-1");
+		Coupon coupon = createCoupon("Open", Instant.parse("2020-01-01T00:00:00Z"), 1);
+
+		couponService.issueCoupon(coupon.getId(), user.getId());
+		couponRedisReservationService.resetCoupon(coupon.getId());
+
+		assertThatThrownBy(() -> couponService.issueCoupon(coupon.getId(), user.getId()))
+				.isInstanceOf(CouponException.class)
+				.extracting("code")
+				.isEqualTo("ALREADY_ISSUED");
+		assertThat(couponIssueRepository.countByCouponId(coupon.getId())).isEqualTo(1);
+	}
+
+	@Test
+	void recoverStaleRedisAlreadyIssuedReservationWhenMysqlHasNoIssue() {
+		UserAccount user = createUser("user-1");
+		Coupon coupon = createCoupon("Open", Instant.parse("2020-01-01T00:00:00Z"), 1);
+
+		assertThat(couponRedisReservationService.reserve(coupon.getId(), user.getId(), 1))
+				.isEqualTo(CouponRedisReservationService.ReservationResult.RESERVED);
+
+		CouponService.CouponIssueResponse response = couponService.issueCoupon(coupon.getId(), user.getId());
+
+		assertThat(response.userId()).isEqualTo(user.getId());
+		assertThat(couponIssueRepository.countByCouponId(coupon.getId())).isEqualTo(1);
+		assertThat(countSlots(coupon.getId(), "ISSUED")).isEqualTo(1);
+	}
+
+	@Test
+	void recoverStaleRedisSoldOutReservationWhenMysqlStillHasStock() {
+		UserAccount staleUser = createUser("user-1");
+		UserAccount actualUser = createUser("user-2");
+		Coupon coupon = createCoupon("Open", Instant.parse("2020-01-01T00:00:00Z"), 1);
+
+		assertThat(couponRedisReservationService.reserve(coupon.getId(), staleUser.getId(), 1))
+				.isEqualTo(CouponRedisReservationService.ReservationResult.RESERVED);
+
+		CouponService.CouponIssueResponse response = couponService.issueCoupon(coupon.getId(), actualUser.getId());
+
+		assertThat(response.userId()).isEqualTo(actualUser.getId());
+		assertThat(couponIssueRepository.countByCouponId(coupon.getId())).isEqualTo(1);
+		assertThat(countSlots(coupon.getId(), "ISSUED")).isEqualTo(1);
+	}
+
+	@Test
+	void rebuildRedisRemainingWhenStaleReservationRetriesAfterMysqlSoldOut() {
+		UserAccount staleUser = createUser("user-1");
+		UserAccount issuedUser = createUser("user-2");
+		UserAccount nextUser = createUser("user-3");
+		Coupon coupon = createCoupon("Open", Instant.parse("2020-01-01T00:00:00Z"), 1);
+		Instant now = Instant.parse("2020-01-01T00:00:01Z");
+
+		assertThat(couponRedisReservationService.reserve(coupon.getId(), staleUser.getId(), 1))
+				.isEqualTo(CouponRedisReservationService.ReservationResult.RESERVED);
+		transactionTemplate.executeWithoutResult(status -> {
+			Long slotId = couponStockSlotDao.lockAvailableSlot(coupon.getId()).orElseThrow();
+			couponStockSlotDao.markIssued(slotId, issuedUser.getId(), now);
+			insertIssue(coupon.getId(), issuedUser.getId(), slotId, now);
+		});
+
+		assertThatThrownBy(() -> couponService.issueCoupon(coupon.getId(), staleUser.getId()))
+				.isInstanceOf(CouponException.class)
+				.extracting("code")
+				.isEqualTo("SOLD_OUT");
+
+		assertThat(couponRedisReservationService.reserve(coupon.getId(), nextUser.getId(), 0))
+				.isEqualTo(CouponRedisReservationService.ReservationResult.SOLD_OUT);
+		assertThat(couponIssueRepository.countByCouponId(coupon.getId())).isEqualTo(1);
+		assertThat(countSlots(coupon.getId(), "ISSUED")).isEqualTo(1);
+	}
+
+	@Test
 	void rollBackStockSlotUpdateWhenIssueInsertFailsByDuplicateKey() {
 		UserAccount user = createUser("user-1");
 		Coupon coupon = createCoupon("Open", Instant.parse("2020-01-01T00:00:00Z"), 2);
@@ -165,6 +243,52 @@ class CouponIssueIntegrationTest {
 		assertThat(couponIssueRepository.countByCouponId(coupon.getId())).isEqualTo(1);
 		assertThat(countSlots(coupon.getId(), "ISSUED")).isEqualTo(1);
 		assertThat(countSlots(coupon.getId(), "AVAILABLE")).isEqualTo(1);
+	}
+
+	@Test
+	void compensateRedisReservationWhenDatabaseDuplicateGuardRejectsIssue() {
+		UserAccount first = createUser("user-1");
+		UserAccount second = createUser("user-2");
+		Coupon coupon = createCoupon("Open", Instant.parse("2020-01-01T00:00:00Z"), 2);
+		Instant now = Instant.parse("2020-01-01T00:00:01Z");
+
+		transactionTemplate.executeWithoutResult(status -> {
+			Long slotId = couponStockSlotDao.lockAvailableSlot(coupon.getId()).orElseThrow();
+			couponStockSlotDao.markIssued(slotId, first.getId(), now);
+			insertIssue(coupon.getId(), first.getId(), slotId, now);
+		});
+
+		assertThatThrownBy(() -> couponService.issueCoupon(coupon.getId(), first.getId()))
+				.isInstanceOf(CouponException.class)
+				.extracting("code")
+				.isEqualTo("ALREADY_ISSUED");
+
+		couponService.issueCoupon(coupon.getId(), second.getId());
+
+		assertThat(couponIssueRepository.countByCouponId(coupon.getId())).isEqualTo(2);
+		assertThat(countSlots(coupon.getId(), "ISSUED")).isEqualTo(2);
+	}
+
+	@Test
+	void compensateRedisReservationWhenOuterTransactionRollsBackAfterIssueReturns() {
+		UserAccount first = createUser("user-1");
+		UserAccount second = createUser("user-2");
+		Coupon coupon = createCoupon("Open", Instant.parse("2020-01-01T00:00:00Z"), 1);
+
+		transactionTemplate.executeWithoutResult(status -> {
+			couponService.issueCoupon(coupon.getId(), first.getId());
+			status.setRollbackOnly();
+		});
+
+		assertThat(couponIssueRepository.countByCouponId(coupon.getId())).isZero();
+		assertThat(countSlots(coupon.getId(), "ISSUED")).isZero();
+		assertThat(countSlots(coupon.getId(), "AVAILABLE")).isEqualTo(1);
+
+		couponService.issueCoupon(coupon.getId(), second.getId());
+
+		assertThat(couponIssueRepository.countByCouponId(coupon.getId())).isEqualTo(1);
+		assertThat(countSlots(coupon.getId(), "ISSUED")).isEqualTo(1);
+		assertThat(countSlots(coupon.getId(), "AVAILABLE")).isZero();
 	}
 
 	@Test

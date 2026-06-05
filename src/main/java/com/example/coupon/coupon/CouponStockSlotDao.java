@@ -54,4 +54,13 @@ public class CouponStockSlotDao {
 					""", couponId, Timestamp.from(createdAt));
 		}
 	}
+
+	public long countIssuedSlots(Long couponId) {
+		Long count = jdbcTemplate.queryForObject("""
+				SELECT COUNT(*)
+				FROM coupon_stock_slots
+				WHERE coupon_id = ? AND status = 'ISSUED'
+				""", Long.class, couponId);
+		return count == null ? 0 : count;
+	}
 }

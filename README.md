@@ -1,15 +1,15 @@
 # Coupon
 
-First-come coupon issuing API using Spring Boot, MySQL, and `SELECT ... FOR UPDATE SKIP LOCKED`.
+First-come coupon issuing API using Spring Boot, Redis, MySQL, and `SELECT ... FOR UPDATE SKIP LOCKED`.
 
 ## Run locally
 
 ```powershell
-docker compose up -d mysql
+docker compose up -d mysql redis
 .\gradlew.bat bootRun
 ```
 
-The Compose MySQL instance is exposed on local port `3307` to avoid collisions with an existing local MySQL.
+The Compose MySQL instance is exposed on local port `3307` to avoid collisions with an existing local MySQL. Redis is exposed on local port `6379`.
 
 ## API quick start
 
@@ -27,7 +27,7 @@ GET /api/me/coupon-issues
 GET /api/coupons/1/stats
 ```
 
-Duplicate issue requests return `409 ALREADY_ISSUED`.
+Duplicate issue requests return `409 ALREADY_ISSUED`. Sold-out requests return `409 SOLD_OUT`.
 
 ## Load test
 
@@ -37,7 +37,7 @@ Run the Docker-based end-to-end load test helper while the Spring API is already
 powershell -ExecutionPolicy Bypass -File .\load-test\run-load-test.ps1
 ```
 
-The default end-to-end mode logs in a distinct user and issues the coupon in each measured iteration. The helper starts Compose MySQL, prepares deterministic data with 500 coupon stock slots, runs `grafana/k6`, writes a k6 summary under `build\load-test`, and verifies the expected MySQL counts. Successful issues are capped at the prepared stock quantity, so `-Iterations 100` expects 100 issued slots and 400 available slots, while iterations above 500 expect 500 successful issues and the rest to return `SOLD_OUT`.
+The default end-to-end mode logs in a distinct user and issues the coupon in each measured iteration. The helper starts Compose MySQL and Redis, prepares deterministic data with 500 coupon stock slots, resets the coupon's Redis reservation keys, runs `grafana/k6`, writes a k6 summary under `build\load-test`, and verifies the expected MySQL counts. Successful issues are capped at the prepared stock quantity, so `-Iterations 100` expects 100 issued slots and 400 available slots, while iterations above 500 expect 500 successful issues and the rest to return `SOLD_OUT`.
 
 Use issue-only mode to pre-authenticate users in the PowerShell runner before k6 starts, then measure only `POST /api/coupons/{couponId}/issues` in the default k6 scenario:
 

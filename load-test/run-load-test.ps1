@@ -71,6 +71,38 @@ function Wait-ForMySql {
     throw "coupon-mysql did not become ready within 120 seconds. Last health status: $finalHealth"
 }
 
+function Get-RedisHealthStatus {
+    $status = & docker inspect -f "{{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}" coupon-redis 2>$null
+    if ($LASTEXITCODE -ne 0) {
+        return $null
+    }
+
+    return $status.Trim()
+}
+
+function Wait-ForRedis {
+    $deadline = (Get-Date).AddSeconds(120)
+
+    while ((Get-Date) -lt $deadline) {
+        $health = Get-RedisHealthStatus
+        if ($health -eq "healthy") {
+            return
+        }
+
+        if ($health -eq "none") {
+            & docker exec coupon-redis redis-cli ping *> $null
+            if ($LASTEXITCODE -eq 0) {
+                return
+            }
+        }
+
+        Start-Sleep -Seconds 2
+    }
+
+    $finalHealth = Get-RedisHealthStatus
+    throw "coupon-redis did not become ready within 120 seconds. Last health status: $finalHealth"
+}
+
 function Invoke-MySql {
     param(
         [Parameter(Mandatory = $true)]
@@ -214,11 +246,14 @@ if (-not (Test-Path $k6Script)) {
 
 New-Item -ItemType Directory -Force -Path $summaryDir | Out-Null
 
-Write-Host "Starting docker compose MySQL..."
-Invoke-Docker -Arguments @("compose", "--project-directory", $repoRoot, "up", "-d", "mysql")
+Write-Host "Starting docker compose MySQL and Redis..."
+Invoke-Docker -Arguments @("compose", "--project-directory", $repoRoot, "up", "-d", "mysql", "redis")
 
 Write-Host "Waiting for coupon-mysql..."
 Wait-ForMySql
+
+Write-Host "Waiting for coupon-redis..."
+Wait-ForRedis
 
 Write-Host "Preparing deterministic load-test data..."
 $prepareSqlText = "SET @coupon_id = $CouponId;`n" + (Get-Content -Raw $prepareSql)
@@ -226,6 +261,16 @@ $prepareSqlText | docker exec -i coupon-mysql mysql -uroot -proot coupon
 if ($LASTEXITCODE -ne 0) {
     throw "Preparing load-test data failed with exit code $LASTEXITCODE."
 }
+
+Write-Host "Resetting Redis reservation state for coupon $CouponId..."
+Invoke-Docker -Arguments @(
+    "exec",
+    "coupon-redis",
+    "redis-cli",
+    "DEL",
+    "coupon:${CouponId}:stock:remaining",
+    "coupon:${CouponId}:users"
+)
 
 $issueOnlySessionsPath = $null
 if ($Mode -eq "IssueOnly") {
