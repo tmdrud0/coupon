@@ -10,7 +10,9 @@ import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.context.SpringBootTest;
 import org.springframework.context.annotation.Import;
 import org.springframework.jdbc.core.JdbcTemplate;
+import org.springframework.transaction.support.TransactionTemplate;
 
+import java.sql.Timestamp;
 import java.time.Instant;
 import java.util.ArrayList;
 import java.util.List;
@@ -22,6 +24,7 @@ import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatExceptionOfType;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 @Import(TestcontainersConfiguration.class)
@@ -46,6 +49,9 @@ class CouponIssueIntegrationTest {
 	@Autowired
 	JdbcTemplate jdbcTemplate;
 
+	@Autowired
+	TransactionTemplate transactionTemplate;
+
 	@BeforeEach
 	void cleanDatabase() {
 		jdbcTemplate.update("DELETE FROM coupon_issues");
@@ -61,9 +67,22 @@ class CouponIssueIntegrationTest {
 
 		CouponService.CouponIssueResponse response = couponService.issueCoupon(coupon.getId(), user.getId());
 
+		assertThat(response.issueId()).isNotNull();
 		assertThat(response.couponId()).isEqualTo(coupon.getId());
+		assertThat(response.couponName()).isEqualTo(coupon.getName());
 		assertThat(response.userId()).isEqualTo(user.getId());
+		assertThat(response.issuedAt()).isNotNull();
 		assertThat(couponIssueRepository.countByCouponId(coupon.getId())).isEqualTo(1);
+	}
+
+	@Test
+	void failMissingCoupon() {
+		UserAccount user = createUser("user-1");
+
+		assertThatThrownBy(() -> couponService.issueCoupon(999999L, user.getId()))
+				.isInstanceOf(CouponException.class)
+				.extracting("code")
+				.isEqualTo("NOT_FOUND");
 	}
 
 	@Test
@@ -81,6 +100,7 @@ class CouponIssueIntegrationTest {
 	@Test
 	void failDuplicateIssue() {
 		UserAccount user = createUser("user-1");
+		UserAccount second = createUser("user-2");
 		Coupon coupon = createCoupon("Open", Instant.parse("2020-01-01T00:00:00Z"), 2);
 
 		couponService.issueCoupon(coupon.getId(), user.getId());
@@ -90,6 +110,12 @@ class CouponIssueIntegrationTest {
 				.extracting("code")
 				.isEqualTo("ALREADY_ISSUED");
 		assertThat(couponIssueRepository.countByCouponId(coupon.getId())).isEqualTo(1);
+		assertThat(countSlots(coupon.getId(), "AVAILABLE")).isEqualTo(1);
+
+		couponService.issueCoupon(coupon.getId(), second.getId());
+
+		assertThat(couponIssueRepository.countByCouponId(coupon.getId())).isEqualTo(2);
+		assertThat(countSlots(coupon.getId(), "ISSUED")).isEqualTo(2);
 	}
 
 	@Test
@@ -105,6 +131,40 @@ class CouponIssueIntegrationTest {
 				.extracting("code")
 				.isEqualTo("SOLD_OUT");
 		assertThat(couponIssueRepository.countByCouponId(coupon.getId())).isEqualTo(1);
+	}
+
+	@Test
+	void failDuplicateAfterSoldOutAsAlreadyIssued() {
+		UserAccount user = createUser("user-1");
+		Coupon coupon = createCoupon("Open", Instant.parse("2020-01-01T00:00:00Z"), 1);
+
+		couponService.issueCoupon(coupon.getId(), user.getId());
+
+		assertThatThrownBy(() -> couponService.issueCoupon(coupon.getId(), user.getId()))
+				.isInstanceOf(CouponException.class)
+				.extracting("code")
+				.isEqualTo("ALREADY_ISSUED");
+		assertThat(couponIssueRepository.countByCouponId(coupon.getId())).isEqualTo(1);
+	}
+
+	@Test
+	void rollBackStockSlotUpdateWhenIssueInsertFailsByDuplicateKey() {
+		UserAccount user = createUser("user-1");
+		Coupon coupon = createCoupon("Open", Instant.parse("2020-01-01T00:00:00Z"), 2);
+		Instant now = Instant.parse("2020-01-01T00:00:01Z");
+
+		couponService.issueCoupon(coupon.getId(), user.getId());
+
+		assertThatExceptionOfType(RuntimeException.class)
+				.isThrownBy(() -> transactionTemplate.executeWithoutResult(status -> {
+					Long slotId = couponStockSlotDao.lockAvailableSlot(coupon.getId()).orElseThrow();
+					couponStockSlotDao.markIssued(slotId, user.getId(), now);
+					insertIssue(coupon.getId(), user.getId(), slotId, now);
+				}));
+
+		assertThat(couponIssueRepository.countByCouponId(coupon.getId())).isEqualTo(1);
+		assertThat(countSlots(coupon.getId(), "ISSUED")).isEqualTo(1);
+		assertThat(countSlots(coupon.getId(), "AVAILABLE")).isEqualTo(1);
 	}
 
 	@Test
@@ -163,6 +223,59 @@ class CouponIssueIntegrationTest {
 		assertThat(distinctUsers).isEqualTo(totalQuantity);
 	}
 
+	@Test
+	void concurrentRequestsFromSameUserCreateOneIssueAndDoNotLoseStock() throws Exception {
+		int totalQuantity = 5;
+		int requestCount = 12;
+		UserAccount user = createUser("user-1");
+		Coupon coupon = createCoupon("Hot", Instant.parse("2020-01-01T00:00:00Z"), totalQuantity);
+
+		CountDownLatch start = new CountDownLatch(1);
+		AtomicInteger successes = new AtomicInteger();
+		AtomicInteger alreadyIssued = new AtomicInteger();
+		AtomicInteger soldOuts = new AtomicInteger();
+		var executor = Executors.newFixedThreadPool(requestCount);
+		try {
+			List<Callable<Void>> tasks = new ArrayList<>();
+			for (int i = 0; i < requestCount; i++) {
+				tasks.add(() -> {
+					start.await(5, TimeUnit.SECONDS);
+					try {
+						couponService.issueCoupon(coupon.getId(), user.getId());
+						successes.incrementAndGet();
+					} catch (CouponException exception) {
+						if ("ALREADY_ISSUED".equals(exception.code())) {
+							alreadyIssued.incrementAndGet();
+						} else if ("SOLD_OUT".equals(exception.code())) {
+							soldOuts.incrementAndGet();
+						} else {
+							throw exception;
+						}
+					}
+					return null;
+				});
+			}
+
+			List<Future<Void>> futures = tasks.stream()
+					.map(executor::submit)
+					.toList();
+			start.countDown();
+			executor.shutdown();
+			assertThat(executor.awaitTermination(30, TimeUnit.SECONDS)).isTrue();
+			for (Future<Void> future : futures) {
+				future.get();
+			}
+		} finally {
+			executor.shutdownNow();
+		}
+
+		assertThat(successes.get()).isEqualTo(1);
+		assertThat(alreadyIssued.get() + soldOuts.get()).isEqualTo(requestCount - 1);
+		assertThat(couponIssueRepository.countByCouponId(coupon.getId())).isEqualTo(1);
+		assertThat(countSlots(coupon.getId(), "ISSUED")).isEqualTo(1);
+		assertThat(countSlots(coupon.getId(), "AVAILABLE")).isEqualTo(totalQuantity - 1);
+	}
+
 	private UserAccount createUser(String username) {
 		return userAccountRepository.saveAndFlush(new UserAccount(username, Instant.now()));
 	}
@@ -177,5 +290,21 @@ class CouponIssueIntegrationTest {
 		));
 		couponStockSlotDao.createSlots(coupon.getId(), totalQuantity, Instant.now());
 		return coupon;
+	}
+
+	private Long countSlots(Long couponId, String status) {
+		return jdbcTemplate.queryForObject(
+				"SELECT COUNT(*) FROM coupon_stock_slots WHERE coupon_id = ? AND status = ?",
+				Long.class,
+				couponId,
+				status
+		);
+	}
+
+	private void insertIssue(Long couponId, Long userId, Long stockSlotId, Instant issuedAt) {
+		jdbcTemplate.update("""
+				INSERT INTO coupon_issues (coupon_id, user_id, stock_slot_id, issued_at)
+				VALUES (?, ?, ?, ?)
+				""", couponId, userId, stockSlotId, Timestamp.from(issuedAt));
 	}
 }
