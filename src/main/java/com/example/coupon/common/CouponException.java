@@ -32,4 +32,8 @@ public class CouponException extends RuntimeException {
 	public static CouponException conflict(String code, String message) {
 		return new CouponException(code, HttpStatus.CONFLICT, message);
 	}
+
+	public static CouponException serviceUnavailable(String code, String message) {
+		return new CouponException(code, HttpStatus.SERVICE_UNAVAILABLE, message);
+	}
 }

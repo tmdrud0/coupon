@@ -59,6 +59,8 @@ class CouponIssueIntegrationTest {
 	void cleanDatabase() {
 		jdbcTemplate.queryForList("SELECT id FROM coupons", Long.class)
 				.forEach(couponRedisReservationService::resetCoupon);
+		jdbcTemplate.update("DELETE FROM outbox_events");
+		jdbcTemplate.update("DELETE FROM coupon_issue_requests");
 		jdbcTemplate.update("DELETE FROM coupon_issues");
 		jdbcTemplate.update("DELETE FROM coupon_stock_slots");
 		jdbcTemplate.update("DELETE FROM coupons");

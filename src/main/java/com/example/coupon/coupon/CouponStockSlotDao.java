@@ -46,6 +46,14 @@ public class CouponStockSlotDao {
 		}
 	}
 
+	public boolean createIssueIfAbsent(Long couponId, Long userId, Long slotId, Instant issuedAt) {
+		int updated = jdbcTemplate.update("""
+				INSERT IGNORE INTO coupon_issues (coupon_id, user_id, stock_slot_id, issued_at)
+				VALUES (?, ?, ?, ?)
+				""", couponId, userId, slotId, Timestamp.from(issuedAt));
+		return updated == 1;
+	}
+
 	public void createSlots(Long couponId, int quantity, Instant createdAt) {
 		for (int i = 0; i < quantity; i++) {
 			jdbcTemplate.update("""

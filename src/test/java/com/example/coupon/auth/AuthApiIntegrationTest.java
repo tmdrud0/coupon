@@ -44,6 +44,8 @@ class AuthApiIntegrationTest {
 
 	@BeforeEach
 	void setUp() {
+		jdbcTemplate.update("DELETE FROM outbox_events");
+		jdbcTemplate.update("DELETE FROM coupon_issue_requests");
 		jdbcTemplate.update("DELETE FROM coupon_issues");
 		jdbcTemplate.update("DELETE FROM coupon_stock_slots");
 		jdbcTemplate.update("DELETE FROM coupons");

@@ -1,15 +1,15 @@
 # Coupon
 
-First-come coupon issuing API using Spring Boot, Redis, MySQL, and `SELECT ... FOR UPDATE SKIP LOCKED`.
+First-come coupon issuing API using Spring Boot, Redis, MySQL, Kafka, and `SELECT ... FOR UPDATE SKIP LOCKED`.
 
 ## Run locally
 
 ```powershell
-docker compose up -d mysql redis
+docker compose up -d mysql redis kafka
 .\gradlew.bat bootRun
 ```
 
-The Compose MySQL instance is exposed on local port `3307` to avoid collisions with an existing local MySQL. Redis is exposed on local port `6379`.
+The Compose MySQL instance is exposed on local port `3307` to avoid collisions with an existing local MySQL. Redis is exposed on local port `6379`, and Kafka is exposed on local port `9092`.
 
 ## API quick start
 
@@ -28,6 +28,24 @@ GET /api/coupons/1/stats
 ```
 
 Duplicate issue requests return `409 ALREADY_ISSUED`. Sold-out requests return `409 SOLD_OUT`.
+
+## Asynchronous coupon issue requests
+
+Authenticated users can submit a request through either asynchronous model:
+
+```http
+POST /api/coupons/1/issue-requests/kafka
+POST /api/coupons/1/issue-requests/outbox
+GET /api/coupon-issue-requests/123
+```
+
+Submission returns `202 Accepted` with a request ID, mode, and `PENDING` status. Status lookup is restricted to the user who submitted the request. Final status is `ISSUED` or `REJECTED`; rejection reasons are `SOLD_OUT`, `ALREADY_ISSUED`, or `NOT_STARTED`. A coupon that has not started is normally rejected during submission with `409 NOT_STARTED`.
+
+`DIRECT_KAFKA` persists and commits the request first, then waits synchronously for the Kafka broker acknowledgement. This intentionally has a dual-write gap: a process crash after the database commit and before publication can leave a pending request unpublished. A publish failure or timeout returns `503 KAFKA_UNAVAILABLE`, but does not prove that Kafka rejected the record, so the request remains `PENDING`. Retrying may publish the same request again; consumer idempotency makes duplicate delivery safe.
+
+`OUTBOX` inserts the request and outbox event in one MySQL transaction. A scheduled publisher claims rows with `FOR UPDATE SKIP LOCKED` and a claim token, publishes them with `couponId` as the Kafka key, and marks them published after broker acknowledgement. Stale claims are retried, so delivery is at least once. Kafka preserves record arrival order within the partition selected by `couponId`; multiple outbox publisher instances do not guarantee that records reach Kafka in original database creation order, so this model does not promise first-submission fairness across publisher instances.
+
+Both modes use the same Kafka consumer. It locks the request, ignores already-final requests, and performs final stock allocation and issue persistence in one MySQL transaction without Redis. The `(coupon_id, user_id)` issue constraint and request status make duplicate delivery idempotent.
 
 ## Load test
 
